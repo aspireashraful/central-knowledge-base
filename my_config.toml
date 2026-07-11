@@ -1,0 +1,45 @@
+[app]
+# LLM used for internal operations, like deriving conversation names
+fast_llm = "groq/llama-3.1-8b-instant"
+
+# LLM used for user-facing output, like RAG replies
+quality_llm = "groq/llama-3.3-70b-versatile"
+
+# LLM used for ingesting visual inputs
+vlm = "groq/llama-3.3-70b-versatile" # TODO - Replace with a vision-capable model if ingesting images
+
+# LLM used for transcription
+audio_lm = "groq/llama-3.3-70b-versatile" # TODO - Replace with an audio model if transcribing
+
+# Reasoning model, used for `research` agent
+reasoning_llm = "groq/llama-3.3-70b-versatile"
+# Planning model, used for `research` agent
+planning_llm = "groq/llama-3.3-70b-versatile"
+
+[embedding]
+provider = "ollama"
+base_model = "mxbai-embed-large"
+base_dimension = 1_024
+batch_size = 128
+concurrent_request_limit = 2
+
+[completion_embedding]
+provider = "ollama"
+base_model = "mxbai-embed-large"
+base_dimension = 1_024
+batch_size = 128
+concurrent_request_limit = 2
+
+[agent]
+tools = ["search_file_knowledge"]
+
+[completion]
+provider = "litellm"
+concurrent_request_limit = 1
+
+  [completion.generation_config]
+  temperature = 0.1
+  top_p = 1
+  max_tokens_to_sample = 1_024
+  stream = false
+  service_tier = "default"

@@ -1,0 +1,48 @@
+services:
+  postgres:
+    image: pgvector/pgvector:pg16
+    environment:
+      POSTGRES_USER: postgres
+      POSTGRES_PASSWORD: postgres
+      POSTGRES_DB: postgres
+    volumes:
+      - pgdata:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U postgres"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+
+  r2r:
+    build:
+      context: .
+      dockerfile: Dockerfile.r2r
+    image: knowledge-base/r2r-patched:latest
+    ports:
+      - "7272:8000"
+    environment:
+      R2R_POSTGRES_USER: postgres
+      R2R_POSTGRES_PASSWORD: postgres
+      R2R_POSTGRES_HOST: postgres
+      R2R_POSTGRES_PORT: 5432
+      R2R_POSTGRES_DBNAME: postgres
+      GROQ_API_KEY: ${GROQ_API_KEY}
+      OLLAMA_API_BASE: http://host.docker.internal:11434
+      R2R_CONFIG_PATH: /app/user_configs/my_config.toml
+    volumes:
+      - ./my_config.toml:/app/user_configs/my_config.toml
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
+    depends_on:
+      postgres:
+        condition: service_healthy
+
+  dashboard:
+    image: sciphiai/r2r-dashboard:latest
+    ports:
+      - "3000:3000"
+    environment:
+      NEXT_PUBLIC_R2R_DEPLOYMENT_URL: http://localhost:7272
+
+volumes:
+  pgdata:

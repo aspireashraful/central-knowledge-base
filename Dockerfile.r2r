@@ -1,0 +1,17 @@
+# Derived from the official R2R image to patch an upstream version-skew bug.
+#
+# The `:latest` image ships R2R 3.6.6 + litellm 1.75.8. litellm normalizes every
+# completion response to `service_tier="auto"`, but R2R's LLMChatCompletion model
+# only allows Literal["scale","default"], so it raises a pydantic ValidationError
+# and returns HTTP 500 on every ingest/RAG call. We widen the field to Optional[str].
+#
+# Pin to a digest for reproducible cloud builds, e.g.:
+#   FROM sciphiai/r2r@sha256:<digest>
+FROM sciphiai/r2r:latest
+
+RUN sed -i \
+      's/service_tier: Optional\[Literal\["scale", "default"\]\] = None/service_tier: Optional[str] = None/' \
+      /app/shared/abstractions/llm.py \
+    # Fail the build loudly if the patch didn't apply (e.g. upstream changed the line),
+    # so this surfaces at build time instead of silently regressing at runtime.
+    && grep -q 'service_tier: Optional\[str\] = None' /app/shared/abstractions/llm.py
