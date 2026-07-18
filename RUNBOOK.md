@@ -55,7 +55,7 @@ All four services run as containers — the whole stack is `docker compose up`, 
 
 | File | Purpose |
 | --- | --- |
-| `docker-compose.yml` | Defines the 4 services (postgres, ollama, r2r, dashboard). |
+| `docker-compose.yml` | Defines the services: postgres, ollama, ollama-init, r2r, dashboard. |
 | `Dockerfile.r2r` | Builds a **patched** R2R image (see §6, Issue 4). |
 | `my_config.toml` | R2R model config — which models play which role. |
 | `.env` | Secrets — holds `GROQ_API_KEY` (do **not** commit). |
@@ -85,19 +85,24 @@ you only need:
 ```bash
 cd /home/ashraful/Programming/knowledge-base
 
-# 1. Build the patched R2R image and start everything
+# This is the only command. It builds the patched R2R image, starts everything,
+# and the `ollama-init` service pulls the embedding model automatically.
 docker compose up -d --build
 
-# 2. Pull the embedding model into the ollama container (one-time; persists in the `ollama` volume)
-docker compose exec ollama ollama pull mxbai-embed-large
-
-# 3. Wait until healthy, then smoke-test
+# Smoke-test once healthy
 curl -s http://localhost:7272/v3/health      # -> {"results":{"message":"ok"}}
 python3 test.py
 ```
 
-> The `ollama/ollama` image is ~8 GB and `mxbai-embed-large` is ~670 MB — the first
-> `up` + model pull takes a while, but both are cached in volumes afterward.
+**How the model gets there (no manual step):** the `ollama-init` service runs
+`ollama pull mxbai-embed-large` with `OLLAMA_HOST=http://ollama:11434`. The CLI is only a
+*client* — it tells the ollama **server** to download, so the weights land in the `ollama`
+named volume, not in the init container. It then exits 0, and r2r is gated on
+`condition: service_completed_successfully`, so R2R never starts before the model exists.
+Re-runs are a fast no-op once the volume is warm.
+
+> First run is slow: the `ollama/ollama` image is ~8 GB and `mxbai-embed-large` is ~670 MB.
+> Both are cached afterward (image + named volume), so later `up`s are quick.
 
 Endpoints:
 - **API:** http://localhost:7272
@@ -157,6 +162,27 @@ applied in the files above — this section is so we (and the next person) under
   registry, so it deploys to any cloud node and survives `docker compose down && up`.
   (An earlier in-container `sed` was wiped the moment the container was recreated — don't do that.)
 
+### Issue 5 — A host port conflict silently breaks the whole stack
+- **Symptom:** `Bind for 0.0.0.0:3000 failed: port is already allocated` (something else on the
+  machine owned port 3000).
+- **Why it matters more than it looks:** this is **not** a dashboard-only problem.
+  1. The failed bind makes the *entire* `docker compose up` exit non-zero, so **r2r never
+     starts** — it's left in `Created`. The RAG API is simply down.
+  2. Worse, the half-created dashboard container persists in a broken state: no port mapping and
+     **not attached to the Compose network** (`docker port` empty; DNS lookups for `dashboard`
+     fail from other containers). A later `up` *starts* that container without repairing it.
+- **Fix:** free the port, then **force-recreate** the broken container — starting it is not enough:
+  ```bash
+  docker compose up -d --force-recreate dashboard
+  docker port knowledge-base-dashboard-1     # verify: 3000/tcp -> 0.0.0.0:3000
+  ```
+- **Design lesson (see also §8):** only services humans reach from outside should publish host
+  ports. Internal traffic uses Compose service DNS (`http://ollama:11434`, `http://r2r:8000`),
+  which is immune to host conflicts — that's why postgres and ollama publish nothing and can
+  never collide. Renumbering a published port (3000→3001→3002) is a band-aid: the host port
+  becomes shared mutable state, and every dependent that hardcodes it is coupled to a number
+  that changes for unrelated reasons.
+
 ---
 
 ## 7. How multi-tenant access control works (verified in `test.py`)
@@ -192,6 +218,23 @@ access-controlled company KB.
       let us drop `Dockerfile.r2r` entirely.
 - [ ] **VLM / audio models** in `my_config.toml` are placeholders pointing at a text model —
       swap for real vision/transcription models if we ingest images or audio.
+- [ ] **Put a reverse proxy at the edge instead of publishing app ports.** Today r2r publishes
+      `7272` and dashboard `3000` directly, which (a) exposes them to the internet with no TLS on
+      a VPS, and (b) makes host port numbers shared state that collides with other stacks
+      (see Issue 5). Target shape — only the proxy binds a host port (`:443`), routing by
+      hostname/path rather than by port:
+      ```
+      browser ──:443──▶ proxy (Caddy/Traefik/nginx)
+                          ├─ kb.company.com/     → dashboard:3000
+                          └─ kb.company.com/api  → r2r:8000
+      ```
+      Internal traffic keeps using service DNS, so internal ports can change freely without
+      touching any dependent service.
+- [ ] **Decouple the dashboard from a host port.** `NEXT_PUBLIC_R2R_DEPLOYMENT_URL` is currently
+      `http://localhost:7272`. Because `NEXT_PUBLIC_` values are baked into the browser bundle, it
+      cannot use `http://r2r:8000` — it must be browser-reachable. That hardcodes the dashboard to
+      a host port number. Behind the proxy above it becomes a stable public URL
+      (`https://kb.company.com/api`) that never changes when internals do.
 
 ---
 
@@ -214,6 +257,17 @@ docker compose logs -f r2r
 docker exec $(docker ps --filter name=r2r -q) \
   grep -n 'service_tier: Optional' /app/shared/abstractions/llm.py
 
-# Stop everything (keeps data volume)
+# Verify the embedding model was seeded into the ollama volume
+docker compose exec ollama ollama list          # -> mxbai-embed-large:latest
+docker compose logs ollama-init                 # should end with a completed pull, exit 0
+
+# Find what is holding a host port (see Issue 5), then repair a broken container
+ss -ltnp | grep ':3000'
+docker compose up -d --force-recreate dashboard
+
+# Stop everything (keeps data volumes)
 docker compose down
+
+# Full reset INCLUDING data + downloaded model (destructive)
+docker compose down -v
 ```

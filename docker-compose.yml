@@ -23,6 +23,22 @@ services:
       timeout: 5s
       retries: 10
 
+  # One-shot init: seeds the embedding model into the `ollama` volume, then exits.
+  # The ollama CLI here is just a client -- OLLAMA_HOST points it at the ollama service,
+  # so the *server* downloads the model into its volume; nothing is stored in this container.
+  # r2r waits for this to complete, so `docker compose up -d` needs no manual pull step.
+  # Re-runs are a fast no-op once the model is cached in the volume.
+  # NOTE: must match [embedding].base_model in my_config.toml.
+  ollama-init:
+    image: ollama/ollama:latest
+    depends_on:
+      ollama:
+        condition: service_healthy
+    environment:
+      OLLAMA_HOST: http://ollama:11434
+    command: ["pull", "mxbai-embed-large"]
+    restart: "no"
+
   r2r:
     build:
       context: .
@@ -46,6 +62,8 @@ services:
         condition: service_healthy
       ollama:
         condition: service_healthy
+      ollama-init:
+        condition: service_completed_successfully
 
   dashboard:
     image: sciphiai/r2r-dashboard:latest
