@@ -13,6 +13,16 @@ services:
       timeout: 5s
       retries: 10
 
+  ollama:
+    image: ollama/ollama:latest
+    volumes:
+      - ollama:/root/.ollama
+    healthcheck:
+      test: ["CMD-SHELL", "ollama list || exit 1"]
+      interval: 10s
+      timeout: 5s
+      retries: 10
+
   r2r:
     build:
       context: .
@@ -27,14 +37,14 @@ services:
       R2R_POSTGRES_PORT: 5432
       R2R_POSTGRES_DBNAME: postgres
       GROQ_API_KEY: ${GROQ_API_KEY}
-      OLLAMA_API_BASE: http://host.docker.internal:11434
+      OLLAMA_API_BASE: http://ollama:11434
       R2R_CONFIG_PATH: /app/user_configs/my_config.toml
     volumes:
       - ./my_config.toml:/app/user_configs/my_config.toml
-    extra_hosts:
-      - "host.docker.internal:host-gateway"
     depends_on:
       postgres:
+        condition: service_healthy
+      ollama:
         condition: service_healthy
 
   dashboard:
@@ -46,3 +56,4 @@ services:
 
 volumes:
   pgdata:
+  ollama:

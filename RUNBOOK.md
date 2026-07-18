@@ -35,14 +35,16 @@ API-first design mapped better to a shared, access-controlled company KB.
                            │               │               │
                   embeddings│         LLM   │        metadata│ + vectors
                            ▼               ▼               ▼
-                  ┌──────────────┐  ┌────────────┐  ┌──────────────────┐
-                  │ Ollama (host)│  │ Groq (API) │  │ Postgres/pgvector│
-                  │ mxbai-embed  │  │ llama-3.x  │  │  (container)     │
-                  │ :11434       │  └────────────┘  └──────────────────┘
-                  └──────────────┘
+                  ┌──────────────────┐  ┌────────────┐  ┌──────────────────┐
+                  │ Ollama (container)│ │ Groq (API) │  │ Postgres/pgvector│
+                  │ mxbai-embed      │  │ llama-3.x  │  │  (container)     │
+                  │ ollama:11434     │  └────────────┘  └──────────────────┘
+                  └──────────────────┘
 ```
 
-- **Embeddings** → local **Ollama** (`mxbai-embed-large`, 1024-dim). No per-token cost, data stays local.
+All four services run as containers — the whole stack is `docker compose up`, no host setup.
+
+- **Embeddings** → **Ollama** (`mxbai-embed-large`, 1024-dim), running as a Compose service. No per-token cost, data stays local.
 - **LLM (RAG answers, summaries)** → **Groq** (`llama-3.3-70b-versatile` / `llama-3.1-8b-instant`). Fast, no local GPU needed.
 - **Storage** → **Postgres + pgvector** (documents, chunks, vectors, users, collections).
 - **Dashboard** → R2R web UI on port 3000 (optional).
@@ -53,7 +55,7 @@ API-first design mapped better to a shared, access-controlled company KB.
 
 | File | Purpose |
 | --- | --- |
-| `docker-compose.yml` | Defines the 3 services (postgres, r2r, dashboard). |
+| `docker-compose.yml` | Defines the 4 services (postgres, ollama, r2r, dashboard). |
 | `Dockerfile.r2r` | Builds a **patched** R2R image (see §6, Issue 4). |
 | `my_config.toml` | R2R model config — which models play which role. |
 | `.env` | Secrets — holds `GROQ_API_KEY` (do **not** commit). |
@@ -61,27 +63,17 @@ API-first design mapped better to a shared, access-controlled company KB.
 
 ---
 
-## 4. Prerequisites (one-time host setup)
+## 4. Prerequisites
+
+Ollama now runs **as a container** (see §6, Issue 1), so there is **no host Ollama setup** —
+you only need:
 
 1. **Docker + Docker Compose** installed.
-2. **Ollama** installed on the host and the embedding model pulled:
+2. **Groq API key** — put it in `.env` (gitignored, so recreate it on each new host):
    ```bash
-   ollama pull mxbai-embed-large
+   echo 'GROQ_API_KEY=gsk_...' > .env
    ```
-3. **Ollama must listen on all interfaces** so the R2R container can reach it
-   (by default it binds to `127.0.0.1` only, which Docker can't reach):
-   ```bash
-   sudo mkdir -p /etc/systemd/system/ollama.service.d
-   printf '[Service]\nEnvironment="OLLAMA_HOST=0.0.0.0"\n' \
-     | sudo tee /etc/systemd/system/ollama.service.d/override.conf
-   sudo systemctl daemon-reload && sudo systemctl restart ollama
-   # verify: `ss -ltnp | grep 11434` should show *:11434 (not 127.0.0.1:11434)
-   ```
-4. **Groq API key** — put it in `.env`:
-   ```
-   GROQ_API_KEY=gsk_...
-   ```
-5. **Python SDK** for running the smoke test:
+3. **Python SDK** for running the smoke test:
    ```bash
    pip install r2r
    ```
@@ -93,13 +85,19 @@ API-first design mapped better to a shared, access-controlled company KB.
 ```bash
 cd /home/ashraful/Programming/knowledge-base
 
-# Build the patched R2R image and start everything
+# 1. Build the patched R2R image and start everything
 docker compose up -d --build
 
-# Wait until healthy, then smoke-test
+# 2. Pull the embedding model into the ollama container (one-time; persists in the `ollama` volume)
+docker compose exec ollama ollama pull mxbai-embed-large
+
+# 3. Wait until healthy, then smoke-test
 curl -s http://localhost:7272/v3/health      # -> {"results":{"message":"ok"}}
 python3 test.py
 ```
+
+> The `ollama/ollama` image is ~8 GB and `mxbai-embed-large` is ~670 MB — the first
+> `up` + model pull takes a while, but both are cached in volumes afterward.
 
 Endpoints:
 - **API:** http://localhost:7272
@@ -118,22 +116,26 @@ These are the real issues we debugged, in the order they surfaced. Each fix is a
 applied in the files above — this section is so we (and the next person) understand *why*.
 
 ### Issue 1 — Container couldn't reach Ollama (`Connection refused`)
-- **Cause:** Ollama was bound to `127.0.0.1:11434`; the R2R container reaches the host via
-  `host.docker.internal` (the Docker bridge), which loopback-only Ollama refuses.
-- **Fix:** `OLLAMA_HOST=0.0.0.0` (see §4, step 3) so Ollama accepts connections from the bridge.
+- **Original cause:** Ollama ran on the *host*, bound to `127.0.0.1:11434`; the R2R container
+  reaching the host via `host.docker.internal` (the Docker bridge) was refused by loopback-only
+  Ollama. The interim fix was `OLLAMA_HOST=0.0.0.0` on the host.
+- **Final fix (current setup):** we **moved Ollama into Compose** as its own service. R2R now
+  talks to it over the Compose network at `OLLAMA_API_BASE: http://ollama:11434` — no host
+  install, no `host.docker.internal`, no loopback-binding gotcha. This is what makes the stack
+  portable to any VPS with a single `docker compose up`.
 
 ### Issue 2 — Error pointed at `localhost:11434`
-- **Cause:** `my_config.toml` hardcoded `http://localhost:11434`. Inside the container,
-  `localhost` is the container itself, not the host.
-- **Fix:** the container reaches the host via `OLLAMA_API_BASE: http://host.docker.internal:11434`
-  (set in `docker-compose.yml`), plus `extra_hosts: host.docker.internal:host-gateway`.
+- **Cause:** `my_config.toml` originally hardcoded `http://localhost:11434`. Inside the container,
+  `localhost` is the container itself, not the Ollama service.
+- **Fix:** R2R resolves Ollama purely from `OLLAMA_API_BASE: http://ollama:11434` (in
+  `docker-compose.yml`); no host addresses are hardcoded anywhere.
 
 ### Issue 3 — `404 page not found` from Ollama during ingestion
 - **Cause:** config referenced `ollama/llama3.1` as the LLM, but that model was never pulled —
   only the embedder (`mxbai-embed-large`) was present.
 - **Fix:** switched all LLM roles to **Groq** in `my_config.toml`
   (`quality_llm = "groq/llama-3.3-70b-versatile"`, `fast_llm = "groq/llama-3.1-8b-instant"`).
-  Embeddings stay on local Ollama. No 5 GB model download needed.
+  Embeddings stay on Ollama. No 5 GB LLM download needed.
 
 ### Issue 4 — `service_tier … Input should be 'scale' or 'default'` (HTTP 500) ⚠️ the tricky one
 - **Cause:** a **version-skew bug inside the official `sciphiai/r2r:latest` image**. It ships
